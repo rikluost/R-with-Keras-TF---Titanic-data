@@ -1,0 +1,260 @@
+---
+title: "Survival prediction on the Titanic disaster using R & Keras"
+author: "Riku Luostari"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is a short and simple Keras implementation for predicting survival on Titanic disaster for Kaggle competition. 
+
+Data given contains 891 passengers and their details and also whether each survived. The task is to predict the reminding 410 passengers survival, based on their details.
+
+The model predicted with 78.46% success and was in top 19% best results out of all submissions at the time (after removing 100% cheaters and 0% correct answers). Short EDA is included. This uses the data that can be loaded from https://www.kaggle.com/c/titanic/data. 
+
+# Load libraries and data
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=T}
+
+# load libraries
+library(reshape2)
+library(tidyverse)
+library(keras)
+
+#load the training- and test data for submission
+titanic.data <- read_csv("train.csv")
+submission.data <- read_csv("test.csv")
+
+titanic.data
+
+```
+
+### Data dictionary:
+
+**Variable**	Definition	Key
+
+- **survival**,	Survival	0 = No, 1 = Yes
+- **pclass**,	Ticket class	1 = 1st, 2 = 2nd, 3 = 3rd
+- **sex**,	Sex	
+- **Age**,	Age in years	
+- **sibsp**,	# of siblings / spouses aboard the Titanic	
+- **parch**,	# of parents / children aboard the Titanic	
+- **ticket**,	Ticket number	
+- **fare**,	Passenger fare	
+- **cabin**,	Cabin number	
+- **embarked**,	Port of Embarkation	C = Cherbourg, Q = Queenstown, S = Southampton
+
+# Short EDA
+
+Looking at the distribution of all features, only age and fare are treated as numeric values, the rest will be categoric. Age seems quite normally distributed even though a bit skewed to the right, but fare is very skewed to the right and logarithmic value will be used instead.
+
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F, fig.height = 5, fig.width = 7.0}
+titanic.data %>% select(-PassengerId) %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+  facet_wrap(~ key, scales = "free") +
+  geom_histogram()
+```
+
+Comparing the age distribution of the survived and the ones who did not, the ones who survived seem to be slightly order, also kids seemed to survive more likely. Survival chances for 70yo or older were slim.
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F, fig.height = 3, fig.width = 7.0}
+ggplot(titanic.data)+
+  geom_density(aes(Age, color=as.factor(Survived)),size=1)
+```
+
+As the fare distribution was heavily skewed to the right, logarithmic scale is used. Looking at the log10 of the fare, higher ticket price seems to have increased the changes for survival. The ones who survived had paid about 10x higher price for their tickets, measured as median.
+
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F, fig.height = 2, fig.width = 7.0}
+ggplot(titanic.data)+
+  geom_boxplot(aes(log(Fare), color=as.factor(Survived)),size=1)+
+  labs(y=NULL)
+```
+
+
+# Cleaning and normalisation of the numeric data
+
+Very little feature engineering is done here and all data is normalised with the mean and standard deviation of the numerical training data. 
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F}
+
+
+
+#set the row indexes for training data. THe rest is left for validation.
+training.idx.start = 178
+training.idx.stop = 891
+
+# limit the max number of dependends to 6
+submission.data$Parch[submission.data$Parch>6] <- 6
+PassengerId <- submission.data$PassengerId
+y <- titanic.data$Survived
+
+#replace missing age and fare with mean values
+mean.age <- as.numeric(titanic.data %>% summarise(m.age=mean(Age, na.rm = T)))
+mean.fare <- as.numeric(titanic.data %>% summarise(m.age=mean(Fare, na.rm = T)))
+
+titanic.data <- titanic.data %>% 
+  mutate(Age = coalesce(Age, mean.age),
+         Fare = coalesce(Fare, mean.fare))
+
+submission.data <- submission.data %>% 
+  mutate(Age = coalesce(Age, mean.age),
+         Fare = coalesce(Fare, mean.fare))
+
+# transform fare into logaritmic scale
+titanic.data$Fare <- log10(titanic.data$Fare+1)
+submission.data$Fare <- log10(submission.data$Fare+1)
+
+
+# normalise with training data mean and standard deviation
+titanic.data.num <- titanic.data %>% select(Age,Fare)
+submission.data.num <- submission.data %>% select(Age,Fare)
+
+mean.df <- apply(titanic.data.num[training.idx.start:training.idx.stop,],2, mean, na.rm=T)
+std.df <-  apply(titanic.data.num[training.idx.start:training.idx.stop,],2, sd, na.rm=T)
+
+titanic.data.num <- scale(titanic.data.num, center = mean.df, scale = std.df)
+submission.data.num <- scale(submission.data.num, center = mean.df, scale = std.df)
+```
+
+
+
+
+
+
+# Cleaning and one-hot encoding the categorical data
+
+All categorical data is cleaned, and correct data types ensured. After this the categorical data is one-hot encoded for easier Keras/Tensorflow digestion.
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F}
+####### categorical cols
+titanic.data.cat <- titanic.data %>% select(Pclass,Sex,SibSp,Parch,Embarked)
+submission.data.cat <- submission.data %>% select(Pclass,Sex,SibSp,Parch,Embarked)
+
+titanic.data.cat$Sex <- as.factor(as.numeric(as.factor(titanic.data.cat$Sex)))
+titanic.data.cat$Embarked <- as.factor(as.numeric(as.factor(titanic.data.cat$Embarked)))
+titanic.data.cat$Parch <- (as.factor(titanic.data.cat$Parch))
+titanic.data.cat$SibSp <- (as.factor(titanic.data.cat$SibSp))
+titanic.data.cat$Pclass <- (as.factor(titanic.data.cat$Pclass))
+
+submission.data.cat$Sex <- as.factor(as.numeric(as.factor(submission.data.cat$Sex)))
+submission.data.cat$Embarked <- as.factor(as.numeric(as.factor(submission.data.cat$Embarked)))
+submission.data.cat$Parch <- (as.factor(submission.data.cat$Parch))
+submission.data.cat$SibSp <- (as.factor(submission.data.cat$SibSp))
+submission.data.cat$Pclass <- (as.factor(submission.data.cat$Pclass))
+
+# replace missing values with "1"
+titanic.data.cat[is.na(titanic.data.cat)] <- "1"
+submission.data.cat[is.na(submission.data.cat)] <- "1"
+
+oneHotEncodeCategoricals <- function(df){
+  output_df <- matrix(numeric(0), nrow = nrow(df), ncol = 1)
+  
+  for (col in colnames(df)) {
+    to_bind <- to_categorical(df %>% pull(col))
+    colnames(to_bind) <- paste0(col, 1:ncol(to_bind))
+    output_df <- cbind(output_df, to_bind)
+  }
+  output_df[,-1]
+}
+
+titanic.data.cat <- oneHotEncodeCategoricals(titanic.data.cat)
+submission.data.cat <- oneHotEncodeCategoricals(submission.data.cat)
+
+#########################                                            
+titanic.data <- cbind(titanic.data.cat, titanic.data.num)
+submission.data <- cbind(submission.data.cat, submission.data.num)
+
+# convert data into matrix for Keras
+x.train <- as.matrix(titanic.data[training.idx.start:training.idx.stop,])
+x.valid <- as.matrix(titanic.data[1:training.idx.start-1,])
+x.test <- as.matrix(submission.data)
+y.train <- as.matrix(y[training.idx.start:training.idx.stop])
+y.valid <- as.matrix(y[1:training.idx.start-1])
+
+colnames(y.train) <- "Survived"
+colnames(y.valid) <- "Survived"
+
+```
+
+# Model creation
+
+Create a simple neural network by using Keras. The hyper parameters were chosen based on results of few iterative runs earlier.
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F}
+build.model <- function(){
+  model <<- keras_model_sequential() %>% 
+    layer_dense(units = 32, activation = "relu", 
+                input_shape = c(29)) %>% 
+    layer_dense(units = 16, 
+                activation = "sigmoid") %>% 
+    layer_dropout(rate = 0.5) %>% 
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  ##################
+  model %>% compile(
+    #optimizer = "rmsprop",
+    optimizer = "adam",
+    loss = "binary_crossentropy",
+    metrics = c("accuracy")
+  ) 
+}
+```
+
+# Training the model
+
+First run is done with training data & validation data with large number of epochs to ensure the final model will not under/over-fit. 
+
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F}
+build.model()
+
+num_epochs <- 300 
+batch_size.k <- 32
+
+history <- model %>% fit(
+  x.train,
+  y.train,
+  epochs = num_epochs,
+  batch_size = batch_size.k,
+  validation_data = list(x.valid, y.valid), verbose = 0)
+
+plot(history)
+```
+
+The model does not seem to improve after around 100 epochs, and starts over fitting.
+
+# The final model
+
+100 epochs are chosen based on the results above, and the model is now trained with all available data.
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=F}
+# Once happy, train it on all available data.
+build.model()
+
+history <- model %>% fit(titanic.data, as.matrix(y),
+                         epochs = 100, 
+                         batch_size = batch_size.k, verbose = 0)
+
+plot(history)
+```
+
+# Make predictions
+
+Make predictions with the final trained model and save those for submission to Kaggle. Show the results of the prediction.
+
+```{r ,warning=FALSE, echo=TRUE, message=FALSE, eval=TRUE, results=T}
+y_test <- model %>% predict_classes(submission.data)
+predictions <- data.frame(PassengerId = as.integer(PassengerId),
+                          Survived = as.integer(y_test))
+
+write_csv(predictions, "predictions_RLu.csv")
+
+predictions
+
+```
+
